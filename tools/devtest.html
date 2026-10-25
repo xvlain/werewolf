@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>狼人杀 · 自动化冒烟测试</title>
+<link rel="stylesheet" href="../css/style.css">
+</head>
+<body>
+<div id="app">
+  <section id="screen-menu" class="screen"><div class="menu-wrap">
+    <label class="toggle"><input type="checkbox" id="opt-godview"><span class="slider"></span><span class="toggle-label">上帝观战</span></label>
+    <label class="toggle"><input type="checkbox" id="opt-fast" checked><span class="slider"></span><span class="toggle-label">快速</span></label>
+    <button class="btn" data-action="single">单人对战</button>
+    <button class="btn" data-action="rules">规则说明</button>
+  </div></section>
+
+  <section id="screen-game" class="screen">
+    <header id="hud">
+      <div class="hud-left"><span id="hud-day" class="hud-chip">第 1 天</span><span id="hud-phase" class="hud-chip phase-night">夜晚</span></div>
+      <div class="hud-center"><span id="hud-alive">存活 12/12</span></div>
+      <div class="hud-right"><button id="btn-godview" class="hud-btn">👁</button><button id="btn-speed" class="hud-btn">⏩</button><button id="btn-quit" class="hud-btn">✕</button></div>
+    </header>
+    <main id="game-main">
+      <div id="table-wrap"><div id="table">
+        <div id="table-center"><div id="center-phase">夜晚</div><div id="center-hint"></div></div>
+        <div id="seats"></div>
+      </div></div>
+      <aside id="side-panel">
+        <div class="panel" id="panel-role"><h3>我的身份</h3><div id="my-role" class="my-role">—</div><div id="my-role-desc" class="role-desc"></div></div>
+        <div class="panel" id="panel-intel"><h3>情报</h3>
+          <div id="intel-checks" class="intel-block"></div><div id="intel-safe" class="intel-block"></div>
+          <div id="intel-wolves" class="intel-block"></div><div id="intel-pattern" class="intel-block"></div></div>
+        <div class="panel" id="panel-log"><h3>发言记录</h3><div id="log-stream" class="log-stream"></div></div>
+      </aside>
+    </main>
+    <footer id="action-bar"><div id="action-title">等待中…</div><div id="action-body"></div><div id="action-buttons"></div></footer>
+    <div id="night-veil" class="night-veil"></div>
+  </section>
+
+  <section id="screen-result" class="screen"><div class="result-wrap">
+    <h2 id="result-title">—</h2><p id="result-reason" class="result-reason"></p>
+    <div id="result-roles" class="result-roles"></div><div id="result-stats" class="result-stats"></div>
+    <div class="result-buttons"><button class="btn" data-action="again">再来一局</button><button class="btn" data-action="back-menu">返回</button></div>
+  </div></section>
+
+  <section id="screen-lobby" class="screen"><div class="lobby-wrap">
+    <header class="panel-head"><button class="btn-back" data-action="back-menu">←</button><h2>多人联机</h2></header>
+    <div class="lobby-body">
+      <div class="field"><label for="inp-nick">昵称</label><input id="inp-nick" type="text"></div>
+      <div class="lobby-actions"><button class="btn" data-action="create-room">创建房间</button>
+        <div class="join-row"><input id="inp-room" type="text"><button class="btn" data-action="join-room">加入</button></div></div>
+      <div id="lobby-status" class="lobby-status"></div>
+      <div id="room-panel" class="room-panel hidden">
+        <div class="room-code">房间号 <b id="room-code-val">----</b></div>
+        <ul id="room-players" class="room-players"></ul>
+        <button class="btn" id="btn-start-room" disabled>开始游戏</button>
+        <label class="toggle"><input type="checkbox" id="opt-aifill" checked><span class="slider"></span><span class="toggle-label">AI 补位</span></label>
+      </div>
+    </div>
+  </div></section>
+
+  <section id="screen-rules" class="screen"><div class="rules-wrap">
+    <header class="panel-head"><button class="btn-back" data-action="back-menu">←</button><h2>规则</h2></header>
+    <div class="rules-body" id="rules-body"></div>
+  </div></section>
+
+  <div id="toast-host"></div>
+  <pre id="out" style="position:fixed;left:0;bottom:0;z-index:9999;background:#000;color:#0f0;font-size:11px;max-height:40vh;overflow:auto;white-space:pre-wrap">RUNNING</pre>
+</div>
+
+<script src="../js/engine.js"></script>
+<script src="../js/ai.js"></script>
+<script src="../js/config.js"></script>
+<script src="../js/net.js"></script>
+<script src="../js/ui.js"></script>
+<script>
+(function () {
+  const out = document.getElementById('out');
+  const errors = [];
+  const logs = [];
+  function say(m) { logs.push(m); out.textContent = logs.slice(-40).join('\n'); }
+
+  window.addEventListener('error', e => { errors.push('ERROR: ' + (e.message || e) + ' @' + (e.filename||'') + ':' + (e.lineno||'')); say(errors[errors.length-1]); });
+  window.addEventListener('unhandledrejection', e => { errors.push('PROMISE: ' + (e.reason && e.reason.message || e.reason)); say(errors[errors.length-1]); });
+  const origErr = console.error;
+  console.error = function () { errors.push('CONSOLE.ERROR: ' + Array.from(arguments).map(String).join(' ')); origErr.apply(console, arguments); };
+
+  const GS = window.WW.UI.GameSession;
+  if (!GS) { say('FATAL: GameSession 未导出'); return; }
+
+  // ---- 自动应答：模拟人类点击 ----
+  let prompts = 0;
+  GS.prototype.promptSeat = function (title, body, filter) {
+    prompts++;
+    const alive = this.engine.getAlivePlayers().filter(p => !filter || filter(p));
+    if (!alive.length) { errors.push('promptSeat 无可选目标: ' + title); return Promise.resolve(null); }
+    return Promise.resolve(alive[Math.floor(Math.random() * alive.length)].id);
+  };
+  GS.prototype.promptChoice = function (title, body, opts) {
+    prompts++;
+    return Promise.resolve(opts[0].value);
+  };
+  GS.prototype.promptContinue = function () { prompts++; return Promise.resolve(true); };
+
+  async function playOne(i, godView) {
+    say(`--- 第 ${i + 1} 局（${godView ? '上帝观战' : '第一人称'}）---`);
+    document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+    document.getElementById('screen-game').classList.add('active');
+    const s = new GS({ godView: godView, nick: '测试员' });
+    const before = errors.length;
+    const r = await s.run();
+    const seatCount = document.querySelectorAll('#seats .seat').length;
+    const logLines = document.querySelectorAll('#log-stream .log-line').length;
+    const resultShown = document.getElementById('screen-result').classList.contains('active');
+    const roleCells = document.querySelectorAll('#result-roles .rr-cell').length;
+    say(`  身份=${s.humanRole} 结果=${r.winner}(${r.reason}) 天数=${s.engine.day}`);
+    say(`  座位渲染=${seatCount}/12 日志行=${logLines} 结算面板=${resultShown} 身份格=${roleCells}/12`);
+    if (seatCount !== 12) errors.push(`座位数错误: ${seatCount}`);
+    if (!resultShown) errors.push('结算面板未显示');
+    if (roleCells !== 12) errors.push(`结算身份格错误: ${roleCells}`);
+    if (errors.length > before) say('  ⚠ 本局新增错误 ' + (errors.length - before));
+    else say('  ✓ 本局无错误');
+    return r;
+  }
+
+  (async function () {
+    // 等待 ui.js 的 DOMContentLoaded 绑定完成，否则事件委托尚未挂载
+    if (document.readyState === 'loading') {
+      await new Promise(r => document.addEventListener('DOMContentLoaded', r));
+    }
+    await new Promise(r => setTimeout(r, 0));
+    try {
+      // 校验底层模块导出
+      const E = window.WW.Engine, A = window.WW.AI;
+      say('模块导出检查: Engine=' + !!E + ' AI=' + !!A + ' Config=' + !!window.WW.Config + ' Net=' + !!window.WW.Net);
+      if (!E || !A) { errors.push('核心模块未导出'); }
+
+      // 规则页渲染
+      document.querySelector('[data-action="rules"]').click();
+      const rulesLen = document.getElementById('rules-body').innerHTML.length;
+      say('规则页渲染字符数=' + rulesLen);
+      if (rulesLen < 500) errors.push('规则页内容为空');
+
+      // 连跑 6 局，覆盖两种视角
+      let good = 0, evil = 0;
+      for (let i = 0; i < 6; i++) {
+        const r = await playOne(i, i % 2 === 1);
+        if (r.winner === 'good') good++; else if (r.winner === 'evil') evil++;
+      }
+      say(`6 局完成：好人胜 ${good} / 狼人胜 ${evil}`);
+      say(`人类交互提示触发 ${prompts} 次`);
+
+      // 最终结论
+      say('');
+      if (errors.length === 0) say('✅ PASS — 全部检查通过，无运行时错误');
+      else {
+        say('❌ FAIL — 共 ' + errors.length + ' 个错误：');
+        errors.slice(0, 20).forEach(e => say('   ' + e));
+      }
+      document.title = errors.length === 0 ? 'TEST_PASS' : 'TEST_FAIL';
+    } catch (e) {
+      errors.push('FATAL: ' + e.message + '\n' + (e.stack || ''));
+      say('❌ FATAL ' + e.message);
+      document.title = 'TEST_FAIL';
+    }
+  })();
+})();
+</script>
+</body>
+</html>
