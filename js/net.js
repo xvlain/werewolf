@@ -205,8 +205,8 @@
       btn.disabled = !(isHost && humans >= 2);
       btn.textContent = humans >= 12 ? '开始游戏' : `开始游戏（${humans}/12 人，不足由 AI 补位）`;
     }
-    // 房主已开局 → 进入对局
-    if (st.state && st.state.phase === 'playing') {
+    // 房主已开局（任何非 lobby 阶段）→ 进入对局
+    if (st.phase && st.phase !== 'lobby') {
       stopPoll();
       window.WW.Net.enterGame(st);
     }

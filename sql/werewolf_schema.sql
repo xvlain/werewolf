@@ -254,11 +254,12 @@ begin
   update wr_players set alive = true where room_id = v_room.id;
 
   update wr_rooms
-     set phase = 'night', day = 1,
+     set phase = 'election', day = 0,
          state = jsonb_build_object(
                  'log', '[]'::jsonb, 'deaths', '[]'::jsonb,
                  'witchAntidoteUsed', false, 'witchPoisonUsed', false,
-                 'sheriff', null, 'winner', null),
+                 'sheriff', null, 'winner', null,
+                 'idiotFlipped', '{}'::jsonb),
          updated_at = now()
    where id = v_room.id;
 
@@ -285,7 +286,7 @@ begin
 
   select role into v_role from wr_roles where room_id = v_room.id and seat = v_seat;
 
-  -- 校验：行动类型必须与身份匹配（防止越权提交）
+  -- 校验：行动类型必须与身份/阶段匹配（防止越权提交）
   if p_kind = 'seer_check' and v_role <> 'seer' then
     raise exception '身份不符：你不是预言家';
   end if;
@@ -295,6 +296,10 @@ begin
   if p_kind = 'wolf_kill' and v_role <> 'werewolf' then
     raise exception '身份不符：你不是狼人';
   end if;
+  if p_kind = 'hunter_shot' and v_role <> 'hunter' then
+    raise exception '身份不符：你不是猎人';
+  end if;
+  -- candidacy / election_vote / vote 不限身份（任何存活玩家均可）
 
   insert into wr_actions(room_id, day, seat, kind, payload)
   values (v_room.id, v_room.day, v_seat, p_kind, coalesce(p_payload,'{}'::jsonb))
@@ -419,18 +424,44 @@ begin
      where room_id = p_room_id and day = v_room.day and kind = 'seer_check';
   end if;
 
+  -- 检查是否有猎人被刀且未被毒 → 进入 hunter_shot
+  declare
+    v_hunter_seat int := null;
+  begin
+    select d.value->>'seat' into v_hunter_seat
+      from jsonb_array_elements(v_deaths) d
+     where d.value->>'cause' = 'wolf_kill'
+       and (select role from wr_roles r where r.room_id=p_room_id
+             and r.seat = (d.value->>'seat')::int) = 'hunter'
+     limit 1;
+    if v_hunter_seat is not null then
+      update wr_rooms
+         set state = v_st || jsonb_build_object(
+               'deaths', v_deaths,
+               'witchAntidoteUsed', coalesce((v_st->>'witchAntidoteUsed')::boolean,false) or v_save,
+               'witchPoisonUsed',   coalesce((v_st->>'witchPoisonUsed')::boolean,false) or (v_poison is not null),
+               'lastKill', v_kill,
+               'pendingHunterSeat', v_hunter_seat),
+             phase = 'hunter_shot',
+             updated_at = now()
+       where id = p_room_id;
+      perform wr_check_win(p_room_id);
+      return;
+    end if;
+  end;
+
   update wr_rooms
      set state = v_st || jsonb_build_object(
            'deaths', v_deaths,
            'witchAntidoteUsed', coalesce((v_st->>'witchAntidoteUsed')::boolean,false) or v_save,
            'witchPoisonUsed',   coalesce((v_st->>'witchPoisonUsed')::boolean,false) or (v_poison is not null),
            'lastKill', v_kill),
-         phase = 'vote',
+         phase = 'speech',
          updated_at = now()
    where id = p_room_id;
 
   perform wr_check_win(p_room_id);
-end $$;
+end $;
 
 -- ---------------------------------------------------------------------------
 -- 9. 投票结算
@@ -466,24 +497,39 @@ begin
   if v_top is not null and not v_tie then
     select role into v_role from wr_roles where room_id = p_room_id and seat = v_top;
 
-    -- 白痴翻牌免死
+    -- 白痴翻牌免死（已翻过的不可再被放逐）
     if v_role = 'idiot' and coalesce((v_st->'idiotFlipped'->>v_top::text)::boolean, false) = false then
       update wr_rooms
          set state = v_st || jsonb_build_object(
-               'expelled', null,
-               'idiotFlipped', coalesce(v_st->'idiotFlipped','{}'::jsonb) || jsonb_build_object(v_top::text, true))
+               'expelled', null, 'idiotFlipSeat', v_top,
+               'idiotFlipped', coalesce(v_st->'idiotFlipped','{}'::jsonb) || jsonb_build_object(v_top::text, true)),
+             phase = 'speech', updated_at = now()
        where id = p_room_id;
-    else
-      update wr_players set alive = false where room_id = p_room_id and seat = v_top and alive;
+      return;
+    end if;
+
+    -- 正常放逐
+    update wr_players set alive = false where room_id = p_room_id and seat = v_top and alive;
+    v_st := v_st || jsonb_build_object('expelled', v_top, 'expelledRole', v_role);
+
+    -- 猎人被放逐 → 进入 hunter_shot 阶段（除非被毒杀，但投票放逐不会被毒）
+    if v_role = 'hunter' then
       update wr_rooms
-         set state = v_st || jsonb_build_object('expelled', v_top, 'expelledRole', v_role),
-             day = v_room.day + 1, phase = 'night', updated_at = now()
+         set state = v_st || jsonb_build_object('pendingHunterSeat', v_top),
+             phase = 'hunter_shot', updated_at = now()
        where id = p_room_id;
       perform wr_check_win(p_room_id);
       return;
     end if;
+
+    update wr_rooms
+       set state = v_st, day = v_room.day + 1, phase = 'night', updated_at = now()
+     where id = p_room_id;
+    perform wr_check_win(p_room_id);
+    return;
   end if;
 
+  -- 平票 / 无人出局 → 进下一夜
   update wr_rooms
      set state = v_st || jsonb_build_object('expelled', null),
          day = v_room.day + 1, phase = 'night', updated_at = now()
@@ -523,61 +569,152 @@ end $$;
 -- ---------------------------------------------------------------------------
 -- 11. 推进状态机（房主驱动；AI 座位的行动由服务端自动生成）
 -- ---------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- 11. 推进状态机（房主驱动；AI 座位的行动由服务端自动生成）
+--     v1.1 新增阶段：election / speech / hunter_shot
+-- ---------------------------------------------------------------------------
 create or replace function wr_advance(p_room text, p_client text)
-returns jsonb language plpgsql security definer set search_path = public as $$
+returns jsonb language plpgsql security definer set search_path = public as $
 declare
   v_room wr_rooms;
   r      record;
   v_ai   jsonb;
-  v_need int;
-  v_have int;
+  v_st   jsonb;
+  v_top_seat int;
+  v_top_cnt  numeric;
+  v_tie      boolean := false;
+  v_hunter_target int;
+  v_expelled_seat int;
 begin
   select * into v_room from wr_rooms where id = upper(p_room);
   if not found then raise exception '房间不存在'; end if;
   if v_room.host_client <> p_client then
-    -- 非房主调用只返回状态，不推进（幂等安全）
+    return wr_room_state(v_room.id, p_client);
+  end if;
+  if v_room.phase = 'over' then return wr_room_state(v_room.id, p_client); end if;
+  v_st := v_room.state;
+
+  -- ========== [election] 警长竞选 ==========
+  if v_room.phase = 'election' then
+    -- AI 候选人自投
+    for r in select p.seat from wr_players p
+              where p.room_id = v_room.id and p.is_ai and p.alive
+                and exists (select 1 from wr_actions a
+                             where a.room_id=v_room.id and a.day=0
+                               and a.seat=p.seat and a.kind='candidacy') loop
+      insert into wr_actions(room_id,day,seat,kind,payload)
+      values (v_room.id, 0, r.seat, 'election_vote',
+              jsonb_build_object('target', r.seat))
+      on conflict (room_id,day,seat,kind) do nothing;
+    end loop;
+    -- AI 非候选人随机投一个候选人
+    for r in select p.seat from wr_players p
+              where p.room_id = v_room.id and p.is_ai and p.alive
+                and not exists (select 1 from wr_actions a
+                                 where a.room_id=v_room.id and a.day=0
+                                   and a.seat=p.seat and a.kind='candidacy') loop
+      insert into wr_actions(room_id,day,seat,kind,payload)
+      select v_room.id, 0, r.seat, 'election_vote',
+             jsonb_build_object('target', c.seat)
+        from (select a2.seat from wr_actions a2
+               where a2.room_id=v_room.id and a2.day=0 and a2.kind='candidacy'
+               order by random() limit 1) c
+      on conflict do nothing;
+    end loop;
+
+    select (a.payload->>'target')::int, count(*) into v_top_seat, v_top_cnt
+      from wr_actions a
+     where a.room_id=v_room.id and a.day=0 and a.kind='election_vote'
+     group by (a.payload->>'target')::int
+     order by count(*) desc limit 1;
+    if v_top_seat is not null then
+      select count(*) > 1 into v_tie
+        from (select (a.payload->>'target')::int t, count(*) c
+                from wr_actions a
+               where a.room_id=v_room.id and a.day=0 and a.kind='election_vote'
+               group by 1) x where x.c = v_top_cnt;
+    end if;
+    if v_top_seat is not null and not v_tie then
+      v_st := v_st || jsonb_build_object('sheriff', v_top_seat);
+    else
+      v_st := v_st || jsonb_build_object('sheriff', null, 'sheriffLost', true);
+    end if;
+    update wr_rooms set state = v_st, phase = 'speech', updated_at = now()
+     where id = v_room.id;
     return wr_room_state(v_room.id, p_client);
   end if;
 
-  if v_room.phase = 'over' then return wr_room_state(v_room.id, p_client); end if;
+  -- ========== [speech] 发言 → 直接进 vote ==========
+  if v_room.phase = 'speech' then
+    update wr_rooms set phase = 'vote', updated_at = now() where id = v_room.id;
+    return wr_room_state(v_room.id, p_client);
+  end if;
 
-  -- 为所有 AI 座位补齐行动
-  for r in select p.seat, ro.role from wr_players p
-             join wr_roles ro on ro.room_id=p.room_id and ro.seat=p.seat
-            where p.room_id = v_room.id and p.is_ai and p.alive loop
-    v_ai := wr_private_ai(v_room.id, r.seat);
-    if v_ai->>'kind' in ('wolf_kill','seer_check','witch') then
-      insert into wr_actions(room_id, day, seat, kind, payload)
-      values (v_room.id, v_room.day, r.seat, v_ai->>'kind',
-              v_ai - 'kind')
-      on conflict (room_id, day, seat, kind) do nothing;
+  -- ========== [hunter_shot] 猎人开枪 ==========
+  if v_room.phase = 'hunter_shot' then
+    v_expelled_seat := (v_st->>'pendingHunterSeat')::int;
+    if v_expelled_seat is null then
+      update wr_rooms set phase = 'night', day = v_room.day + 1, updated_at = now()
+       where id = v_room.id;
+      return wr_room_state(v_room.id, p_client);
     end if;
-  end loop;
-
-  -- AI 投票：随机投给一名存活玩家（v1 启发式）
-  for r in select p.seat from wr_players p
-            where p.room_id = v_room.id and p.is_ai and p.alive loop
-    if not exists (select 1 from wr_actions a where a.room_id=v_room.id
-                    and a.day=v_room.day and a.seat=r.seat and a.kind='vote') then
-      insert into wr_actions(room_id, day, seat, kind, payload)
-      select v_room.id, v_room.day, r.seat, 'vote',
-             jsonb_build_object('target', q.seat)
-        from (select p2.seat from wr_players p2
-               where p2.room_id=v_room.id and p2.alive and p2.seat <> r.seat
-               order by random() limit 1) q
-      on conflict do nothing;
+    select (a.payload->>'target')::int into v_hunter_target
+      from wr_actions a
+     where a.room_id=v_room.id and a.day=v_room.day
+       and a.seat=v_expelled_seat and a.kind='hunter_shot' limit 1;
+    if v_hunter_target is not null then
+      update wr_players set alive = false
+       where room_id=v_room.id and seat=v_hunter_target and alive;
+      v_st := v_st || jsonb_build_object('hunterShot',
+        jsonb_build_object('shooter', v_expelled_seat, 'target', v_hunter_target,
+          'targetRole', (select role from wr_roles where room_id=v_room.id and seat=v_hunter_target)));
+    else
+      v_st := v_st || jsonb_build_object('hunterShot',
+        jsonb_build_object('shooter', v_expelled_seat, 'target', null));
     end if;
-  end loop;
+    update wr_rooms set state = v_st, phase = 'night', day = v_room.day + 1, updated_at = now()
+     where id = v_room.id;
+    perform wr_check_win(v_room.id);
+    return wr_room_state(v_room.id, p_client);
+  end if;
 
+  -- ========== [night] 夜晚结算 ==========
   if v_room.phase = 'night' then
-    -- 需行动的神职/狼是否都已提交（真人）
+    for r in select p.seat, ro.role from wr_players p
+               join wr_roles ro on ro.room_id=p.room_id and ro.seat=p.seat
+              where p.room_id = v_room.id and p.is_ai and p.alive loop
+      v_ai := wr_private_ai(v_room.id, r.seat);
+      if v_ai->>'kind' in ('wolf_kill','seer_check','witch') then
+        insert into wr_actions(room_id, day, seat, kind, payload)
+        values (v_room.id, v_room.day, r.seat, v_ai->>'kind', v_ai - 'kind')
+        on conflict (room_id, day, seat, kind) do nothing;
+      end if;
+    end loop;
     perform wr_resolve_night(v_room.id);
-  elsif v_room.phase = 'vote' then
+    return wr_room_state(v_room.id, p_client);
+  end if;
+
+  -- ========== [vote] 放逐投票 ==========
+  if v_room.phase = 'vote' then
+    for r in select p.seat from wr_players p
+              where p.room_id = v_room.id and p.is_ai and p.alive loop
+      if not exists (select 1 from wr_actions a where a.room_id=v_room.id
+                      and a.day=v_room.day and a.seat=r.seat and a.kind='vote') then
+        insert into wr_actions(room_id, day, seat, kind, payload)
+        select v_room.id, v_room.day, r.seat, 'vote',
+               jsonb_build_object('target', q.seat)
+          from (select p2.seat from wr_players p2
+                 where p2.room_id=v_room.id and p2.alive and p2.seat <> r.seat
+                 order by random() limit 1) q
+        on conflict do nothing;
+      end if;
+    end loop;
     perform wr_resolve_vote(v_room.id);
+    return wr_room_state(v_room.id, p_client);
   end if;
 
   return wr_room_state(v_room.id, p_client);
-end $$;
+end $;
 
 -- ---------------------------------------------------------------------------
 -- 12. 读取房间状态（公共信息 + 仅本人身份与私密结果）
@@ -682,6 +819,16 @@ do $$ begin
   end if;
 exception when others then null;
 end $$;
+
+-- ---------------------------------------------------------------------------
+-- 15. v1.1 增量迁移（已部署用户执行此段即可升级，无需重跑全文）
+-- ---------------------------------------------------------------------------
+do $ begin
+  if not exists (select 1 from information_schema.columns
+                  where table_name='wr_players' and column_name='sheriff_candidate') then
+    alter table wr_players add column sheriff_candidate boolean default false;
+  end if;
+end $;
 
 -- ============================================================================
 -- 安装完成。验证：
