@@ -461,7 +461,7 @@ begin
    where id = p_room_id;
 
   perform wr_check_win(p_room_id);
-end $;
+end $$;
 
 -- ---------------------------------------------------------------------------
 -- 9. 投票结算
@@ -574,7 +574,7 @@ end $$;
 --     v1.1 新增阶段：election / speech / hunter_shot
 -- ---------------------------------------------------------------------------
 create or replace function wr_advance(p_room text, p_client text)
-returns jsonb language plpgsql security definer set search_path = public as $
+returns jsonb language plpgsql security definer set search_path = public as $$
 declare
   v_room wr_rooms;
   r      record;
@@ -714,7 +714,7 @@ begin
   end if;
 
   return wr_room_state(v_room.id, p_client);
-end $;
+end $$;
 
 -- ---------------------------------------------------------------------------
 -- 12. 读取房间状态（公共信息 + 仅本人身份与私密结果）
@@ -823,12 +823,12 @@ end $$;
 -- ---------------------------------------------------------------------------
 -- 15. v1.1 增量迁移（已部署用户执行此段即可升级，无需重跑全文）
 -- ---------------------------------------------------------------------------
-do $ begin
+do $$ begin
   if not exists (select 1 from information_schema.columns
                   where table_name='wr_players' and column_name='sheriff_candidate') then
     alter table wr_players add column sheriff_candidate boolean default false;
   end if;
-end $;
+end $$;
 
 -- ============================================================================
 -- 安装完成。验证：
